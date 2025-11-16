@@ -1,414 +1,650 @@
-# ============================================
-# ULTRA-ENHANCED DOCUMENT EXTRACTOR v3.0
-# Maximum Accuracy for Indian Documents
-# ============================================
-
-# STEP 1: Install Dependencies
-!pip install -q pytesseract pillow pdf2image opencv-python-headless
-!apt-get -qq install tesseract-ocr tesseract-ocr-mar tesseract-ocr-hin tesseract-ocr-eng
-!apt-get -qq install poppler-utils
-
-print("✅ All dependencies installed with full language support!")
-
-# ============================================
-# STEP 2: ULTRA-ENHANCED ML MODEL v3.0
-# ============================================
-
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-import cv2
-import numpy as np
-import json
-from pdf2image import convert_from_path
 import os
-from pathlib import Path
-import re
-from datetime import datetime
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-class UltraEnhancedExtractor:
-    """
-    Ultra-enhanced document extraction with maximum accuracy
-    """
+import tempfile
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Optional, Tuple
+
+import streamlit as st
+from PIL import Image
+import fitz  # PyMuPDF
+import plotly.graph_objects as go
+import plotly.express as px
+
+from utils.image_quality import compute_ela_analysis, save_ela_visualization
+from utils.ocr_extraction import extract_document_text, write_ocr_results, initialize_ocr_engine
+from utils.qr_detection import find_qr_codes, draw_qr_annotations
+from utils.watermark_check import locate_watermark, score_watermark_authenticity
+from utils.layout_check import analyze_document_structure, save_layout_overlay
+from utils.validation import compute_final_verdict, persist_analysis_log
+from utils.ml_model import classify_document, load_classifier_model
+from utils.config import (
+    ELA_OUTPUT_DIR, OCR_OUTPUT_DIR, QR_OUTPUT_DIR, 
+    LAYOUT_OUTPUT_DIR, WATERMARK_TEMPLATE_PATH
+)
+from utils.logger import logger
+
+# Page configuration
+st.set_page_config(
+    page_title="Document Forgery Detection",
+    page_icon="🔍",
+    layout="wide"
+)
+
+# Initialize session state
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = {}
+if 'final_verdict' not in st.session_state:
+    st.session_state.final_verdict = None
+
+
+def safe_delete_file(file_path: str, max_retries: int = 5, delay: float = 0.1) -> bool:
+    """Safely delete a file on Windows, handling file lock issues.
     
-    def __init__(self):
-        self.supported_formats = ['.jpg', '.jpeg', '.png', '.pdf']
+    Args:
+        file_path: Path to the file to delete
+        max_retries: Maximum number of retry attempts
+        delay: Delay between retries in seconds
         
-    def super_preprocess(self, image):
-        """Multiple preprocessing techniques for best results"""
-        if isinstance(image, Image.Image):
-            img_pil = image
-            image = np.array(image)
+    Returns:
+        True if file was deleted successfully, False otherwise
+    """
+    if not os.path.exists(file_path):
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            os.remove(file_path)
+            return True
+        except (OSError, PermissionError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay * (attempt + 1))  # Exponential backoff
+            else:
+                logger.warning(f"Failed to delete {file_path} after {max_retries} attempts: {e}")
+                return False
+    return False
+
+
+def convert_pdf_to_image(pdf_path: str, page_number: int = 0) -> Optional[Image.Image]:
+    """Convert a PDF page to a PIL Image.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_number: Page number to convert (0-indexed, default: first page)
+        
+    Returns:
+        PIL Image object or None if conversion fails
+    """
+    try:
+        pdf_document = fitz.open(pdf_path)
+        if page_number >= len(pdf_document):
+            logger.warning(f"Page {page_number} not found in PDF, using first page")
+            page_number = 0
+        
+        page = pdf_document[page_number]
+        # Render page to a pixmap (image) with high DPI for quality
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better quality
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pdf_document.close()
+        return img
+    except Exception as e:
+        logger.error(f"PDF conversion failed: {e}")
+        return None
+
+
+def run_analysis_pipeline(image_path: str) -> Tuple[Dict, Dict]:
+    """Execute all 7 analysis stages on a document image.
+    
+    Args:
+        image_path: Path to uploaded document image
+        
+    Returns:
+        Tuple of (stage_results_dict, final_verdict_dict)
+    """
+    results = {}
+    
+    # Stage 1: Error Level Analysis
+    with st.spinner("Analyzing image quality (ELA)..."):
+        ela_map, anomaly = compute_ela_analysis(image_path)
+        if ela_map is not None:
+            ela_path = ELA_OUTPUT_DIR / "ela_result.png"
+            save_ela_visualization(ela_map, str(ela_path))
+            results["image_quality"] = {
+                "anomaly_score": anomaly,
+                "visualization_path": str(ela_path)
+            }
         else:
-            img_pil = Image.fromarray(image)
-        
-        # Technique 1: Enhanced PIL preprocessing
-        img_pil = img_pil.convert('L')  # Grayscale
-        enhancer = ImageEnhance.Contrast(img_pil)
-        img_pil = enhancer.enhance(2.0)  # Increase contrast
-        enhancer = ImageEnhance.Sharpness(img_pil)
-        img_pil = enhancer.enhance(2.0)  # Sharpen
-        
-        # Technique 2: OpenCV preprocessing
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        
-        # Apply bilateral filter to reduce noise while keeping edges
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-        
-        # CLAHE
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(filtered)
-        
-        # Adaptive thresholding
-        thresh = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(thresh, h=10)
-        
-        return img_pil, denoised
+            results["image_quality"] = {"anomaly_score": 0.0, "visualization_path": None}
     
-    def extract_with_multiple_attempts(self, image_path):
-        """Try multiple OCR configurations for best results"""
-        image = Image.open(image_path)
-        pil_processed, cv_processed = self.super_preprocess(image)
-        
-        results = []
-        
-        # Config 1: Multi-language with PSM 6 (uniform text block)
-        config1 = r'--oem 3 --psm 6 -l eng+mar+hin'
-        text1 = pytesseract.image_to_string(cv_processed, config=config1)
-        conf1_data = pytesseract.image_to_data(cv_processed, output_type=pytesseract.Output.DICT, config=config1)
-        conf1 = self.get_avg_confidence(conf1_data)
-        results.append((text1, conf1, 'Multi-lang PSM6'))
-        
-        # Config 2: English only with PSM 6
-        config2 = r'--oem 3 --psm 6 -l eng'
-        text2 = pytesseract.image_to_string(pil_processed, config=config2)
-        conf2_data = pytesseract.image_to_data(pil_processed, output_type=pytesseract.Output.DICT, config=config2)
-        conf2 = self.get_avg_confidence(conf2_data)
-        results.append((text2, conf2, 'English PSM6'))
-        
-        # Config 3: Multi-language with PSM 3 (automatic page segmentation)
-        config3 = r'--oem 3 --psm 3 -l eng+mar+hin'
-        text3 = pytesseract.image_to_string(cv_processed, config=config3)
-        conf3_data = pytesseract.image_to_data(cv_processed, output_type=pytesseract.Output.DICT, config=config3)
-        conf3 = self.get_avg_confidence(conf3_data)
-        results.append((text3, conf3, 'Multi-lang PSM3'))
-        
-        # Pick best result
-        best_result = max(results, key=lambda x: x[1])
-        print(f"   Best OCR config: {best_result[2]} (confidence: {best_result[1]:.2f}%)")
-        
-        # Combine all texts for comprehensive extraction
-        combined_text = "\n\n".join([r[0] for r in results])
-        
-        return best_result[0], combined_text, best_result[1]
+    # Stage 2: OCR Text Extraction
+    with st.spinner("Extracting text (OCR)..."):
+        ocr_engine = initialize_ocr_engine()
+        ocr_data = extract_document_text(image_path, ocr_engine)
+        ocr_path = OCR_OUTPUT_DIR / "ocr_result.txt"
+        write_ocr_results(ocr_data, str(ocr_path))
+        results["ocr"] = {
+            **ocr_data,
+            "output_path": str(ocr_path)
+        }
     
-    def get_avg_confidence(self, data):
-        """Calculate average confidence from OCR data"""
-        confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
-        return sum(confidences) / len(confidences) if confidences else 0
+    # Stage 3: QR Code Detection
+    with st.spinner("Detecting QR codes..."):
+        qr_data = find_qr_codes(image_path)
+        if qr_data["detected"]:
+            qr_path = QR_OUTPUT_DIR / "qr_annotated.png"
+            draw_qr_annotations(image_path, qr_data, str(qr_path))
+            qr_data["visualization_path"] = str(qr_path)
+        results["qr"] = qr_data
     
-    def extract_marksheet_advanced(self, text, combined_text):
-        """Advanced marksheet extraction with multiple pattern attempts"""
-        data = {}
-        
-        # Use both best text and combined text for extraction
-        all_text = text + "\n\n" + combined_text
-        
-        # Student name - multiple patterns
-        name_patterns = [
-            r"CANDIDATE'?S?\s*FULL\s*NAME[:\s]*(?:\([^)]*\))?\s*([A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+)",
-            r"Bonde\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
-            r"NAME[:\s]*([A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z][a-z]+)",
-        ]
-        for pattern in name_patterns:
-            match = re.search(pattern, all_text, re.IGNORECASE)
-            if match:
-                if len(match.groups()) == 1:
-                    data['student_name'] = match.group(1).strip()
-                else:
-                    data['student_name'] = ' '.join(match.groups()).strip()
-                break
-        
-        # If still not found, try finding "Bonde" and context
-        if 'student_name' not in data:
-            bonde_match = re.search(r'Bonde\s+(\w+)\s+(\w+)', all_text, re.IGNORECASE)
-            if bonde_match:
-                data['student_name'] = f"Bonde {bonde_match.group(1)} {bonde_match.group(2)}"
-        
-        # Mother's name
-        mother_patterns = [
-            r"MOTHER'?S?\s*NAME[:\s]*([A-Z][a-z]+)",
-            r"MOTHER[:\s]*([A-Z][a-z]+)",
-        ]
-        for pattern in mother_patterns:
-            match = re.search(pattern, all_text, re.IGNORECASE)
-            if match:
-                data['mother_name'] = match.group(1).strip()
-                break
-        
-        # Seat number - multiple patterns
-        seat_patterns = [
-            r'SEAT\s*NO\.?[:\s]*([A-Z]?\d{6,8})',
-            r'H(\d{6,8})',
-            r'SEAT[:\s]*([A-Z0-9]{6,10})',
-        ]
-        for pattern in seat_patterns:
-            match = re.search(pattern, all_text, re.IGNORECASE)
-            if match:
-                data['seat_number'] = match.group(1).strip()
-                break
-        
-        # Year
-        year_patterns = [
-            r'YEAR\s*OF\s*EXAM[:\s]*(\d{4})',
-            r'20\d{2}',
-            r'\b(2021|2022|2023|2024|2025)\b',
-        ]
-        for pattern in year_patterns:
-            match = re.search(pattern, all_text)
-            if match:
-                data['exam_year'] = match.group(1) if '(' in pattern else match.group(0)
-                break
-        
-        # Extract marks - ROBUST PATTERNS
-        subjects = []
-        
-        # Pattern 1: Traditional format
-        marks_patterns = [
-            # Code | Subject | Max | Obtained
-            r'(\d{1,2})\s+([A-Z][A-Z\s&/()]+?)\s+(\d{3})\s*\|\s*(\d{2,3})',
-            # Subject | Max | Obtained
-            r'([A-Z][A-Z\s&/()]+?)\s+(\d{3})\s*\|\s*(\d{2,3})',
-            # With words: MARATHI ... 100 | 087 | EIGHTYSEVEN
-            r'(\d{1,2})?\s*([A-Z][A-Z\s&/()]+?)\s+(\d{3})\s*\|\s*(\d{2,3})\s*\|\s*([A-Z]+)',
-        ]
-        
-        # Known subjects to look for
-        known_subjects = ['MARATHI', 'SANSKRIT', 'ENGLISH', 'MATHEMATICS', 'SCIENCE', 'SOCIAL']
-        
-        for subject_name in known_subjects:
-            # Look for pattern: SUBJECT_NAME ... numbers
-            pattern = rf'{subject_name}[^0-9]*?(\d{{3}})[^0-9]*?(\d{{2,3}})'
-            match = re.search(pattern, all_text, re.IGNORECASE)
-            if match:
-                subjects.append({
-                    'name': subject_name,
-                    'max_marks': int(match.group(1)),
-                    'obtained_marks': int(match.group(2))
-                })
-        
-        # If subjects found, calculate totals
-        if subjects:
-            data['subjects'] = subjects
-            total_obtained = sum(s['obtained_marks'] for s in subjects)
-            total_max = sum(s['max_marks'] for s in subjects)
-            data['total_marks'] = f"{total_obtained}/{total_max}"
-            data['percentage'] = round((total_obtained / total_max) * 100, 2) if total_max > 0 else 0
-        
-        # Look for total marks in text
-        total_patterns = [
-            r'(\d{3,4})\s*/\s*(\d{3,4})',
-            r'TOTAL[:\s]*(\d{3,4})',
-        ]
-        for pattern in total_patterns:
-            match = re.search(pattern, all_text)
-            if match and 'total_marks' not in data:
-                if len(match.groups()) == 2:
-                    data['total_marks'] = f"{match.group(1)}/{match.group(2)}"
-                else:
-                    data['total_obtained'] = match.group(1)
-        
-        # Result
-        result_patterns = [
-            r'Result[:\s]*(PASS|FAIL|ATKT)',
-            r'\b(PASS|FAIL)\b',
-        ]
-        for pattern in result_patterns:
-            match = re.search(pattern, all_text, re.IGNORECASE)
-            if match:
-                data['result'] = match.group(1).upper()
-                break
-        
-        # Percentage from text
-        perc_patterns = [
-            r'(\d{2}\.\d{2})%',
-            r'Percentage[:\s]*(\d{2}\.\d{2})',
-        ]
-        for pattern in perc_patterns:
-            match = re.search(pattern, all_text)
-            if match and 'percentage' not in data:
-                data['percentage'] = float(match.group(1))
-                break
-        
-        return data
+    # Stage 4: Watermark Verification
+    with st.spinner("Checking watermark..."):
+        watermark_data = locate_watermark(image_path, WATERMARK_TEMPLATE_PATH)
+        authenticity = score_watermark_authenticity(watermark_data)
+        watermark_data["authenticity_score"] = authenticity
+        results["watermark"] = watermark_data
     
-    def extract(self, file_path):
-        """Main extraction with ultra-enhanced features"""
-        file_path = Path(file_path)
-        
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        if file_path.suffix.lower() not in self.supported_formats:
-            raise ValueError(f"Unsupported format. Supported: {self.supported_formats}")
-        
-        print(f"\n{'='*70}")
-        print(f"🔍 ULTRA-ENHANCED EXTRACTION v3.0")
-        print(f"{'='*70}")
-        print(f"📄 File: {file_path.name}")
-        print(f"📊 Size: {file_path.stat().st_size / 1024:.2f} KB")
-        print(f"⏱️  Started: {datetime.now().strftime('%H:%M:%S')}")
-        print(f"{'-'*70}")
-        
-        # Multi-attempt extraction
-        print("🔬 Running multiple OCR attempts...")
-        best_text, combined_text, confidence = self.extract_with_multiple_attempts(str(file_path))
-        
-        print(f"✅ Extraction complete - Confidence: {confidence:.2f}%")
-        
-        # Document type
-        doc_type = 'marksheet'  # Assuming marksheet for now
-        print(f"📑 Document Type: {doc_type.upper()}")
-        
-        # Advanced extraction
-        print(f"🔬 Running advanced pattern matching...")
-        structured = self.extract_marksheet_advanced(best_text, combined_text)
-        
-        # Extract general info
-        general = self.extract_general_info(combined_text)
-        structured.update(general)
-        
-        # Calculate quality
-        quality_score = self.calculate_quality(best_text, confidence, structured)
-        
-        result = {
-            'file_info': {
-                'file_name': file_path.name,
-                'file_size_kb': round(file_path.stat().st_size / 1024, 2),
-                'extraction_timestamp': datetime.now().isoformat()
-            },
-            'document_info': {
-                'document_type': doc_type,
-                'quality_score': quality_score,
-                'extraction_method': 'Ultra-Enhanced v3.0'
-            },
-            'extracted_data': structured,
-            'raw_text': best_text.strip(),
-            'metadata': {
-                'total_characters': len(best_text),
-                'total_words': len(best_text.split()),
-                'ocr_confidence': round(confidence, 2),
-                'extraction_quality': self.get_quality_label(quality_score)
+    # Stage 5: Layout Analysis
+    with st.spinner("Analyzing layout..."):
+        layout_data = analyze_document_structure(image_path)
+        if layout_data["valid"]:
+            layout_path = LAYOUT_OUTPUT_DIR / "layout_visualization.png"
+            save_layout_overlay(image_path, layout_data, str(layout_path))
+            layout_data["visualization_path"] = str(layout_path)
+        results["layout"] = layout_data
+    
+    # Stage 6: ML Classification
+    with st.spinner("Running ML model..."):
+        model, device = load_classifier_model()
+        ml_result = classify_document(image_path, model, device)
+        results["ml_model"] = ml_result
+    
+    # Stage 7: Final Validation
+    with st.spinner("Computing final verdict..."):
+        verdict = compute_final_verdict(results)
+        persist_analysis_log(results, verdict)
+        results["validation_log_path"] = str(Path("outputs/logs/last_run.json"))
+    
+    return results, verdict
+
+
+def render_premium_validation_dashboard(verdict: Dict) -> None:
+    """Render a premium dashboard-style UI for Stage 7 validation summary.
+    
+    Args:
+        verdict: Final validation result dictionary
+    """
+    if not verdict:
+        st.warning("No validation data available")
+        return
+    
+    verdict_text = verdict.get("verdict", "UNKNOWN")
+    score = verdict.get("overall_score", 0.0)
+    confidence = verdict.get("confidence", "LOW")
+    stage_scores = verdict.get("stage_scores", {})
+    
+    # Color scheme based on verdict
+    color_map = {
+        "GENUINE": {"bg": "#10b981", "text": "#ffffff", "border": "#059669", "icon": "✅"},
+        "LIKELY GENUINE": {"bg": "#3b82f6", "text": "#ffffff", "border": "#2563eb", "icon": "✓"},
+        "SUSPICIOUS": {"bg": "#f59e0b", "text": "#ffffff", "border": "#d97706", "icon": "⚠️"},
+        "FAKE": {"bg": "#ef4444", "text": "#ffffff", "border": "#dc2626", "icon": "❌"},
+        "ERROR": {"bg": "#6b7280", "text": "#ffffff", "border": "#4b5563", "icon": "⚠️"}
+    }
+    
+    colors = color_map.get(verdict_text, color_map["ERROR"])
+    confidence_colors = {
+        "HIGH": "#10b981",
+        "MEDIUM": "#f59e0b",
+        "LOW": "#ef4444"
+    }
+    
+    # Main Verdict Card
+    st.markdown("""
+    <style>
+    .verdict-card {
+        background: linear-gradient(135deg, """ + colors["bg"] + """ 0%, """ + colors["border"] + """ 100%);
+        padding: 2rem;
+        border-radius: 16px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        margin-bottom: 2rem;
+        border: 2px solid """ + colors["border"] + """;
+    }
+    .verdict-title {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: """ + colors["text"] + """;
+        margin: 0;
+        text-align: center;
+    }
+    .verdict-subtitle {
+        font-size: 1.2rem;
+        color: """ + colors["text"] + """;
+        opacity: 0.9;
+        text-align: center;
+        margin-top: 0.5rem;
+    }
+    .metric-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        border-left: 4px solid """ + colors["bg"] + """;
+    }
+    .stage-badge {
+        display: inline-block;
+        padding: 0.5rem 1rem;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.9rem;
+        margin: 0.25rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Verdict Card
+    st.markdown(f"""
+    <div class="verdict-card">
+        <h1 class="verdict-title">{colors["icon"]} {verdict_text}</h1>
+        <p class="verdict-subtitle">Confidence: <strong>{confidence}</strong> | Overall Score: <strong>{score:.2f}/100</strong></p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Main Metrics Row
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3 style="color: #6b7280; font-size: 0.9rem; margin: 0; text-transform: uppercase;">Overall Score</h3>
+            <h2 style="color: {colors['bg']}; font-size: 2.5rem; margin: 0.5rem 0;">{score:.1f}</h2>
+            <p style="color: #9ca3af; margin: 0;">out of 100</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        confidence_color = confidence_colors.get(confidence, "#6b7280")
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3 style="color: #6b7280; font-size: 0.9rem; margin: 0; text-transform: uppercase;">Confidence</h3>
+            <h2 style="color: {confidence_color}; font-size: 2.5rem; margin: 0.5rem 0;">{confidence}</h2>
+            <p style="color: #9ca3af; margin: 0;">assessment level</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        verdict_icon = colors["icon"]
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3 style="color: #6b7280; font-size: 0.9rem; margin: 0; text-transform: uppercase;">Verdict</h3>
+            <h2 style="color: {colors['bg']}; font-size: 2.5rem; margin: 0.5rem 0;">{verdict_icon}</h2>
+            <p style="color: #9ca3af; margin: 0;">{verdict_text}</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Gauge Meter
+    st.subheader("📊 Authenticity Score Gauge")
+    fig_gauge = go.Figure(go.Indicator(
+        mode = "gauge+number+delta",
+        value = score,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': "Authenticity Score", 'font': {'size': 24}},
+        delta = {'reference': 50, 'position': "top"},
+        gauge = {
+            'axis': {'range': [None, 100]},
+            'bar': {'color': colors["bg"]},
+            'steps': [
+                {'range': [0, 30], 'color': "#fee2e2"},
+                {'range': [30, 60], 'color': "#fef3c7"},
+                {'range': [60, 80], 'color': "#dbeafe"},
+                {'range': [80, 100], 'color': "#d1fae5"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 50
             }
         }
-        
-        print(f"✅ Complete!")
-        print(f"🎯 Quality: {quality_score}/100 ({self.get_quality_label(quality_score)})")
-        print(f"{'='*70}\n")
-        
-        return result
+    ))
+    fig_gauge.update_layout(
+        height=300,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={'color': "#1f2937"}
+    )
+    st.plotly_chart(fig_gauge, use_container_width=True)
     
-    def extract_general_info(self, text):
-        """Extract general information"""
-        data = {}
-        
-        # All reference numbers
-        numbers = re.findall(r'\b([A-Z]*\d{6,}[A-Z]*)\b', text)
-        if numbers:
-            data['reference_numbers'] = list(set(numbers))[:5]
-        
-        # All dates
-        dates = re.findall(r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b', text)
-        if dates:
-            data['dates'] = list(set(dates))
-        
-        return data
+    st.markdown("<br>", unsafe_allow_html=True)
     
-    def calculate_quality(self, text, confidence, structured):
-        """Calculate quality score"""
-        score = 0
-        score += (confidence / 100) * 40
-        score += min(len(text) / 10, 20)
-        score += min(len(structured) * 5, 40)
-        return min(round(score, 2), 100)
+    # Stage Scores Breakdown
+    st.subheader("📋 Stage-wise Analysis Breakdown")
     
-    def get_quality_label(self, score):
-        """Get quality label"""
-        if score >= 90: return "EXCELLENT"
-        elif score >= 75: return "GOOD"
-        elif score >= 60: return "FAIR"
-        else: return "POOR"
+    # Stage names mapping
+    stage_names = {
+        "ela": "🔍 Image Quality (ELA)",
+        "ocr": "📝 OCR Text Extraction",
+        "qr": "📱 QR Code Detection",
+        "watermark": "💧 Watermark Verification",
+        "layout": "📐 Layout Analysis",
+        "ml": "🤖 ML Classification"
+    }
     
-    def generate_report(self, result):
-        """Generate detailed report"""
-        lines = []
-        lines.append("="*70)
-        lines.append("📋 EXTRACTION REPORT")
-        lines.append("="*70)
+    # Create table data
+    table_data = []
+    for stage_key, stage_score in stage_scores.items():
+        stage_name = stage_names.get(stage_key, stage_key.upper())
+        # Determine color based on score
+        if stage_score >= 80:
+            score_color = "#10b981"
+            status = "Excellent"
+        elif stage_score >= 60:
+            score_color = "#3b82f6"
+            status = "Good"
+        elif stage_score >= 40:
+            score_color = "#f59e0b"
+            status = "Fair"
+        else:
+            score_color = "#ef4444"
+            status = "Poor"
         
-        lines.append(f"\n📄 FILE:")
-        lines.append(f"   {result['file_info']['file_name']} ({result['file_info']['file_size_kb']} KB)")
+        table_data.append({
+            "Stage": stage_name,
+            "Score": f"{stage_score:.2f}",
+            "Status": status,
+            "Color": score_color
+        })
+    
+    # Display as styled table
+    for row in table_data:
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            st.markdown(f"**{row['Stage']}**")
+        with col2:
+            st.markdown(f"<span style='color: {row['Color']}; font-weight: 700; font-size: 1.1rem;'>{row['Score']}/100</span>", unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"<span style='background: {row['Color']}20; color: {row['Color']}; padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.85rem;'>{row['Status']}</span>", unsafe_allow_html=True)
         
-        lines.append(f"\n📊 QUALITY:")
-        lines.append(f"   Score: {result['document_info']['quality_score']}/100")
-        lines.append(f"   Rating: {result['metadata']['extraction_quality']}")
-        lines.append(f"   OCR Confidence: {result['metadata']['ocr_confidence']}%")
+        # Progress bar
+        progress_color = row['Color']
+        st.markdown(f"""
+        <div style="background: #e5e7eb; height: 8px; border-radius: 4px; margin: 0.5rem 0 1rem 0; overflow: hidden;">
+            <div style="background: {progress_color}; height: 100%; width: {float(row['Score'])}%; transition: width 0.3s;"></div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Radar Chart
+    if len(stage_scores) > 0:
+        st.subheader("🎯 Stage Performance Radar Chart")
         
-        lines.append(f"\n🔍 EXTRACTED DATA:")
-        for key, value in result['extracted_data'].items():
-            if isinstance(value, list) and value:
-                if isinstance(value[0], dict):
-                    lines.append(f"   {key.replace('_', ' ').title()}:")
-                    for item in value:
-                        lines.append(f"      - {item}")
-                else:
-                    lines.append(f"   {key.replace('_', ' ').title()}: {', '.join(map(str, value[:3]))}")
-            elif value:
-                lines.append(f"   {key.replace('_', ' ').title()}: {value}")
+        categories = [stage_names.get(k, k.upper()) for k in stage_scores.keys()]
+        values = list(stage_scores.values())
         
-        lines.append("="*70)
-        return "\n".join(lines)
+        # Convert hex color to rgba for transparency
+        def hex_to_rgba(hex_color, alpha=0.5):
+            """Convert hex color to rgba string."""
+            hex_color = hex_color.lstrip('#')
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            return f"rgba({r}, {g}, {b}, {alpha})"
+        
+        fig_radar = go.Figure()
+        
+        fig_radar.add_trace(go.Scatterpolar(
+            r=values,
+            theta=categories,
+            fill='toself',
+            name='Stage Scores',
+            line_color=colors["bg"],
+            fillcolor=hex_to_rgba(colors["bg"], 0.5)
+        ))
+        
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100]
+                )),
+            showlegend=True,
+            height=400,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font={'color': "#1f2937"}
+        )
+        
+        st.plotly_chart(fig_radar, use_container_width=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Collapsible JSON View (using checkbox since we can't nest expanders)
+    show_json = st.checkbox("🔧 Show Debug: Raw JSON Data", value=False)
+    if show_json:
+        st.json(verdict)
 
-print("✅ Ultra-Enhanced Model v3.0 loaded!")
 
-# ============================================
-# STEP 3: RUN EXTRACTION
-# ============================================
+def render_verdict_display(verdict: Dict) -> None:
+    """Display final verdict with appropriate styling.
+    
+    Args:
+        verdict: Final validation result dictionary
+    """
+    st.header("🎯 Final Verdict")
+    
+    verdict_text = verdict["verdict"]
+    score = verdict["overall_score"]
+    confidence = verdict["confidence"]
+    
+    if verdict_text == "GENUINE":
+        st.success(f"**{verdict_text}** - Confidence: {confidence} | Score: {score:.2f}/100")
+    elif verdict_text == "FAKE":
+        st.error(f"**{verdict_text}** - Confidence: {confidence} | Score: {score:.2f}/100")
+    else:
+        st.warning(f"**{verdict_text}** - Confidence: {confidence} | Score: {score:.2f}/100")
 
-from google.colab import files
 
-print("\n" + "="*70)
-print("📤 UPLOAD YOUR DOCUMENT")
-print("="*70)
-print("Supports: JPG, PNG, PDF | Multi-language: English, Marathi, Hindi\n")
+def render_stage_results(results: Dict) -> None:
+    """Render collapsible sections for each analysis stage.
+    
+    Args:
+        results: Dictionary containing all stage results
+    """
+    st.header("📊 Stage-wise Results")
+    
+    # Stage 1: Image Quality
+    with st.expander("🔍 Stage 1: Image Quality Analysis (ELA)", expanded=False):
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            vis_path = results.get("image_quality", {}).get("visualization_path")
+            if vis_path and Path(vis_path).exists():
+                st.image(vis_path, caption="ELA Visualization", use_container_width=True)
+        with col2:
+            anomaly = results.get("image_quality", {}).get("anomaly_score", 0.0)
+            st.metric("Anomaly Score", f"{anomaly:.2f}")
+            st.caption("Lower score = more authentic")
+    
+    # Stage 2: OCR
+    with st.expander("📝 Stage 2: OCR Text Extraction", expanded=False):
+        ocr = results.get("ocr", {})
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.text_area("Extracted Text", ocr.get("text", "No text found"), 
+                        height=150, disabled=True)
+        with col2:
+            st.metric("Confidence", f"{ocr.get('confidence', 0.0):.2%}")
+            st.metric("Word Count", ocr.get("word_count", 0))
+    
+    # Stage 3: QR Codes
+    with st.expander("📱 Stage 3: QR Code Detection", expanded=False):
+        qr = results.get("qr", {})
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if qr.get("detected") and qr.get("visualization_path"):
+                vis_path = qr["visualization_path"]
+                if Path(vis_path).exists():
+                    st.image(vis_path, caption="QR Code Detection", use_container_width=True)
+            else:
+                st.info("No QR codes detected")
+        with col2:
+            st.metric("QR Codes Found", qr.get("count", 0))
+            for i, code in enumerate(qr.get("codes", [])):
+                st.caption(f"QR {i+1}: {code.get('data', 'N/A')[:30]}...")
+    
+    # Stage 4: Watermark
+    with st.expander("💧 Stage 4: Watermark Verification", expanded=False):
+        wm = results.get("watermark", {})
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.metric("Watermark Detected", "Yes" if wm.get("detected") else "No")
+        with col2:
+            auth = wm.get("authenticity_score", 0.0)
+            st.metric("Authenticity Score", f"{auth:.2f}/100")
+            if wm.get("location"):
+                st.caption(f"Location: {wm['location']}")
+    
+    # Stage 5: Layout
+    with st.expander("📐 Stage 5: Layout Analysis", expanded=False):
+        layout = results.get("layout", {})
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if layout.get("valid") and layout.get("visualization_path"):
+                vis_path = layout["visualization_path"]
+                if Path(vis_path).exists():
+                    st.image(vis_path, caption="Layout Visualization", use_container_width=True)
+        with col2:
+            score = layout.get("score", 0.0)
+            st.metric("Layout Score", f"{score:.2%}")
+            features = layout.get("features", {})
+            st.caption(f"Text Regions: {features.get('text_regions', 0)}")
+            st.caption(f"Alignment: {features.get('alignment_score', 0):.2%}")
+    
+    # Stage 6: ML Model
+    with st.expander("🤖 Stage 6: ML Model Classification", expanded=False):
+        ml = results.get("ml_model", {})
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.metric("Prediction", ml.get("class", "UNKNOWN"))
+            st.metric("Confidence", f"{ml.get('confidence', 0.0):.2%}")
+        with col2:
+            probs = ml.get("probabilities", {})
+            st.caption(f"Genuine: {probs.get('genuine', 0):.2%}")
+            st.caption(f"Fake: {probs.get('fake', 0):.2%}")
+    
+    # Stage 7: Validation Summary
+    with st.expander("✅ Stage 7: Final Validation Summary", expanded=True):
+        render_premium_validation_dashboard(st.session_state.final_verdict)
 
-uploaded = files.upload()
 
-if uploaded:
-    file_path = list(uploaded.keys())[0]
+# Sidebar: File upload
+st.sidebar.header("📤 Upload Document")
+uploaded_file = st.sidebar.file_uploader(
+    "Choose an image or PDF file",
+    type=['png', 'jpg', 'jpeg', 'pdf'],
+    help="Upload a document image or PDF to analyze"
+)
+
+# Main content area
+if uploaded_file is not None:
+    col1, col2 = st.columns([1, 1])
     
-    extractor = UltraEnhancedExtractor()
-    result = extractor.extract(file_path)
+    with col1:
+        st.subheader("📄 Uploaded Document")
+        
+        # Check if file is PDF or image
+        file_extension = uploaded_file.name.split('.')[-1].lower() if uploaded_file.name else ''
+        is_pdf = file_extension == 'pdf'
+        image = None
+        
+        if is_pdf:
+            # Save PDF temporarily and convert to image
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                tmp_pdf.write(uploaded_file.getvalue())
+                tmp_pdf_path = tmp_pdf.name
+            
+            # Convert first page of PDF to image
+            image = convert_pdf_to_image(tmp_pdf_path, page_number=0)
+            if image is None:
+                st.error("❌ Failed to convert PDF to image")
+                safe_delete_file(tmp_pdf_path)
+            else:
+                st.image(image, caption="Uploaded Document (PDF - First Page)", use_container_width=True)
+                # Clean up temporary PDF file
+                safe_delete_file(tmp_pdf_path)
+        else:
+            # Handle image files
+            try:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Uploaded Document", use_container_width=True)
+            except Exception as e:
+                st.error(f"❌ Failed to open image: {str(e)}")
+                image = None
     
-    # Show report
-    report = extractor.generate_report(result)
-    print("\n" + report)
+    if image is not None and st.button("🚀 Analyze Document", type="primary", use_container_width=True):
+        # Save uploaded file temporarily
+        if is_pdf:
+            # Save PDF and convert to image for analysis
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                tmp_pdf.write(uploaded_file.getvalue())
+                tmp_pdf_path = tmp_pdf.name
+            
+            # Convert PDF to image
+            converted_image = convert_pdf_to_image(tmp_pdf_path, page_number=0)
+            if converted_image is None:
+                st.error("❌ Failed to convert PDF to image for analysis")
+                safe_delete_file(tmp_pdf_path)
+            else:
+                # Save converted image temporarily
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_img:
+                    converted_image.save(tmp_img.name)
+                    tmp_path = tmp_img.name
+                
+                # Close the converted image to release file handle
+                converted_image.close()
+                
+                # Clean up PDF file
+                safe_delete_file(tmp_pdf_path)
+                
+                try:
+                    results, verdict = run_analysis_pipeline(tmp_path)
+                    st.session_state.analysis_results = results
+                    st.session_state.final_verdict = verdict
+                    st.success("✅ Analysis complete!")
+                except Exception as e:
+                    logger.error(f"Analysis pipeline failed: {e}")
+                    st.error(f"❌ Error during processing: {str(e)}")
+                finally:
+                    # Add a small delay to ensure all file handles are closed
+                    time.sleep(0.1)
+                    safe_delete_file(tmp_path)
+        else:
+            # Save image file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                image.save(tmp_file.name)
+                tmp_path = tmp_file.name
+            
+            # Note: Don't close 'image' here as it's used for display above
+            # The saved file handle is already closed by the context manager
+            
+            try:
+                results, verdict = run_analysis_pipeline(tmp_path)
+                st.session_state.analysis_results = results
+                st.session_state.final_verdict = verdict
+                st.success("✅ Analysis complete!")
+            except Exception as e:
+                logger.error(f"Analysis pipeline failed: {e}")
+                st.error(f"❌ Error during processing: {str(e)}")
+            finally:
+                # Add a small delay to ensure all file handles are closed
+                time.sleep(0.1)
+                safe_delete_file(tmp_path)
     
-    # Show JSON
-    print("\n" + "="*70)
-    print("💾 COMPLETE JSON OUTPUT:")
-    print("="*70)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    
-    # Save
-    with open('ultra_extraction.json', 'w', encoding='utf-8') as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    
-    files.download('ultra_extraction.json')
-    print("\n✅ JSON file downloaded!")
-else:
-    print("❌ No file uploaded!")
+    # Display results if available
+    if st.session_state.final_verdict:
+        st.divider()
+        render_verdict_display(st.session_state.final_verdict)
+        st.divider()
+        render_stage_results(st.session_state.analysis_results)
